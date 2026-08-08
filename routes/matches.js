@@ -5,15 +5,24 @@ const { FreshCache } = require('../services/cache');
 const dataSource = require('../services/sportsDataSource');
 const analytics = require('../services/analytics');
 
+// Live scores need to feel current, but API-Football's free tier caps you at
+// ~100 requests/day total. This cache is separate from the notification
+// poller in server.js — every screen load that hits /matches/live would
+// otherwise trigger its own API call. A 3-minute cache means several users
+// (or one user refreshing) share the same underlying API call instead of
+// each one costing a fresh request.
 const liveCache = new FreshCache({
   maxAgeMs: 3 * 60 * 1000,
   refreshFn: dataSource.fetchLiveMatches,
   label: 'live-matches',
 });
 
+// GET /matches/live
 router.get('/live', async (req, res) => {
   try {
     const matches = await liveCache.ensureFresh();
+    // req.deviceId is set by a lightweight header the RN app sends (see below) —
+    // falls back to undefined, which just means this check won't count toward uniqueDevices.
     analytics.trackLiveScoreCheck(req.headers['x-device-id']);
     res.json({ matches });
   } catch (err) {
@@ -21,6 +30,8 @@ router.get('/live', async (req, res) => {
   }
 });
 
+// GET /matches/today  (or GET /matches/today?date=YYYY-MM-DD for another day —
+// same route, used by the Home screen's day-picker)
 router.get('/today', async (req, res) => {
   try {
     const date = req.query.date || new Date().toISOString().slice(0, 10);
@@ -31,11 +42,14 @@ router.get('/today', async (req, res) => {
   }
 });
 
+// GET /matches/followed?userId=123
+// Cross-references the user's followed teams against live + today's fixtures.
 router.get('/followed', async (req, res) => {
   const { userId } = req.query;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
   try {
+    // TODO: replace with a real DB lookup of this user's followed team IDs
     const followedTeamIds = await req.app.locals.db.getFollowedTeamIds(userId);
 
     const [live, today] = await Promise.all([
@@ -52,12 +66,17 @@ router.get('/followed', async (req, res) => {
   }
 });
 
+// GET /matches/:id — full detail for the match detail screen.
+// Events (who scored, cards, subs) are fetched here on-demand — this is the
+// ONLY place fetchMatchEvents() gets called, deliberately, so opening 50
+// different matches costs 50 requests but background polling never does.
 router.get('/:id', async (req, res) => {
   try {
     const live = await liveCache.ensureFresh();
     let match = live.find((m) => String(m.id) === req.params.id);
 
     if (!match) {
+      // Not currently live — could be a finished or upcoming match a user tapped from Home
       const today = new Date().toISOString().slice(0, 10);
       const todayMatches = await dataSource.fetchFixtures({ date: today });
       match = todayMatches.find((m) => String(m.id) === req.params.id);
@@ -66,6 +85,9 @@ router.get('/:id', async (req, res) => {
 
     const events = await dataSource.fetchMatchEvents(match.id);
 
+    // This is the exact scenario from your viewing-center question: someone
+    // checking a match's detail screen WHILE it's live. High counts here are
+    // the strongest signal that faster (paid-tier) polling would be noticed.
     if (match.status === 'live') {
       analytics.trackLiveMatchDetailView(req.headers['x-device-id']);
     }
@@ -73,6 +95,30 @@ router.get('/:id', async (req, res) => {
     res.json({ match: { ...match, events } });
   } catch (err) {
     res.status(502).json({ error: 'Failed to load match' });
+  }
+});
+
+// GET /matches/:id/stats — only called when a user taps the Stats tab,
+// not part of the base match load, to conserve request budget.
+router.get('/:id/stats', async (req, res) => {
+  try {
+    const stats = await dataSource.fetchMatchStatistics(req.params.id);
+    res.json({ stats });
+  } catch (err) {
+    res.status(502).json({ error: 'Failed to load match stats' });
+  }
+});
+
+// GET /matches/:id/lineups — same on-demand pattern. Note: API-Football only
+// publishes lineups roughly 1 hour before kickoff — for matches further out,
+// this will return an empty array, which the frontend should treat as
+// "lineup not announced yet", not an error.
+router.get('/:id/lineups', async (req, res) => {
+  try {
+    const lineups = await dataSource.fetchMatchLineups(req.params.id);
+    res.json({ lineups });
+  } catch (err) {
+    res.status(502).json({ error: 'Failed to load lineups' });
   }
 });
 
